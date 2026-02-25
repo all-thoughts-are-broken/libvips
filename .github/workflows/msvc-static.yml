@@ -1,0 +1,146 @@
+name: MSVC Static Build
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build-msvc-static:
+    name: Windows x64 MSVC Static
+    runs-on: windows-2022
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Meson and Ninja
+        run: python -m pip install --upgrade pip meson ninja
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg "$env:VCPKG_ROOT"
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static `
+            glib `
+            expat `
+            zlib `
+            libjpeg-turbo `
+            libpng `
+            libwebp `
+            tiff
+
+      - name: Install pkgconf host tool
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows pkgconf
+
+      - name: Prepare build environment
+        shell: pwsh
+        run: |
+          $pkgconfDir = "$env:VCPKG_ROOT\installed\x64-windows\tools\pkgconf"
+          $pkgconf = Get-ChildItem -Path $pkgconfDir -Recurse -File |
+            Where-Object { $_.Name -in @('pkgconf.exe', 'pkg-config.exe') } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $pkgconf) {
+            throw "pkgconf executable not found under $pkgconfDir"
+          }
+
+          $pc = "$env:VCPKG_ROOT\installed\x64-windows-static\lib\pkgconfig"
+          "PKG_CONFIG=$pkgconf" >> $env:GITHUB_ENV
+          "PKG_CONFIG_PATH=$pc" >> $env:GITHUB_ENV
+          "PKG_CONFIG_LIBDIR=$pc" >> $env:GITHUB_ENV
+          "CC=cl" >> $env:GITHUB_ENV
+          "CXX=cl" >> $env:GITHUB_ENV
+
+      - name: Configure libvips
+        shell: pwsh
+        run: |
+          meson setup build-msvc-static `
+            --buildtype=release `
+            --default-library=static `
+            -Db_vscrt=mt `
+            --auto-features=disabled `
+            -Dmodules=disabled `
+            -Ddeprecated=false `
+            -Dexamples=false `
+            -Dman=false `
+            -Dpo=false `
+            -Dtests=false `
+            -Dtools=false `
+            -Dcplusplus=true `
+            -Dintrospection=disabled `
+            -Dvapi=false `
+            -Ddocs=false `
+            -Dcpp-docs=false `
+            -Dzlib=enabled `
+            -Djpeg=enabled `
+            -Dpng=enabled `
+            -Dtiff=enabled `
+            -Dwebp=enabled
+
+      - name: Build libvips
+        run: meson compile -C build-msvc-static
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $out = Join-Path $PWD "out"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          meson install -C build-msvc-static --destdir $out --no-rebuild
+
+          Copy-Item "$out\lib\libvips.a" "$out\lib\libvips.lib" -Force
+          if (Test-Path "$out\lib\libvips-cpp.a") {
+            Copy-Item "$out\lib\libvips-cpp.a" "$out\lib\libvips-cpp.lib" -Force
+          }
+
+          $line = (& $env:PKG_CONFIG --libs --static `
+            glib-2.0 gio-2.0 gobject-2.0 expat zlib libjpeg libpng libwebp libwebpmux libwebpdemux libtiff-4).Trim()
+
+          @(
+            "libvips static (MSVC) dependency notes"
+            ""
+            "pkg-config --libs --static result:"
+            $line
+            ""
+            "Common Windows SDK libs to link when needed:"
+            "- ws2_32.lib"
+            "- winmm.lib"
+            "- shlwapi.lib"
+            "- dnsapi.lib"
+            "- iphlpapi.lib"
+          ) | Set-Content -Path "$out\DEPENDENCIES.txt" -Encoding UTF8
+
+      - name: Upload static artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: libvips-msvc-static-x64
+          path: |
+            out/include/**
+            out/lib/**
+            out/DEPENDENCIES.txt
+
+      - name: Print Meson log on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path "build-msvc-static\meson-logs\meson-log.txt") {
+            Get-Content "build-msvc-static\meson-logs\meson-log.txt"
+          }
