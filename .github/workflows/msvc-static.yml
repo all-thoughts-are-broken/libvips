@@ -9,8 +9,6 @@ jobs:
   build-msvc-static:
     name: Windows x64 MSVC Static
     runs-on: windows-2022
-    env:
-      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
 
     steps:
       - name: Checkout code
@@ -29,16 +27,29 @@ jobs:
       - name: Install Meson and Ninja
         run: python -m pip install --upgrade pip meson ninja
 
+      - name: Set vcpkg workspace path
+        shell: pwsh
+        run: |
+          $vcpkgDir = Join-Path $env:GITHUB_WORKSPACE "vcpkg"
+          "VCPKG_DIR=$vcpkgDir" >> $env:GITHUB_ENV
+
       - name: Bootstrap vcpkg
         shell: pwsh
         run: |
-          git clone --depth 1 https://github.com/microsoft/vcpkg "$env:VCPKG_ROOT"
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          if (-not (Test-Path "$env:VCPKG_DIR\.git")) {
+            git clone --depth 1 https://github.com/microsoft/vcpkg "$env:VCPKG_DIR"
+          }
+
+          if (Test-Path "$env:VCPKG_DIR\bootstrap-vcpkg.bat") {
+            & "$env:VCPKG_DIR\bootstrap-vcpkg.bat" -disableMetrics
+          } elseif (-not (Test-Path "$env:VCPKG_DIR\vcpkg.exe")) {
+            throw "vcpkg executable not found at $env:VCPKG_DIR"
+          }
 
       - name: Install vcpkg dependencies
         shell: pwsh
         run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static `
+          & "$env:VCPKG_DIR\vcpkg.exe" install --triplet x64-windows-static `
             glib `
             expat `
             zlib `
@@ -50,12 +61,12 @@ jobs:
       - name: Install pkgconf host tool
         shell: pwsh
         run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows pkgconf
+          & "$env:VCPKG_DIR\vcpkg.exe" install --triplet x64-windows pkgconf
 
       - name: Prepare build environment
         shell: pwsh
         run: |
-          $pkgconfDir = "$env:VCPKG_ROOT\installed\x64-windows\tools\pkgconf"
+          $pkgconfDir = "$env:VCPKG_DIR\installed\x64-windows\tools\pkgconf"
           $pkgconf = Get-ChildItem -Path $pkgconfDir -Recurse -File |
             Where-Object { $_.Name -in @('pkgconf.exe', 'pkg-config.exe') } |
             Select-Object -First 1 -ExpandProperty FullName
@@ -63,7 +74,7 @@ jobs:
             throw "pkgconf executable not found under $pkgconfDir"
           }
 
-          $pc = "$env:VCPKG_ROOT\installed\x64-windows-static\lib\pkgconfig"
+          $pc = "$env:VCPKG_DIR\installed\x64-windows-static\lib\pkgconfig"
           "PKG_CONFIG=$pkgconf" >> $env:GITHUB_ENV
           "PKG_CONFIG_PATH=$pc" >> $env:GITHUB_ENV
           "PKG_CONFIG_LIBDIR=$pc" >> $env:GITHUB_ENV
