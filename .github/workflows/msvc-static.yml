@@ -7,8 +7,26 @@ permissions: {}
 
 jobs:
   build-msvc-static:
-    name: Windows x64 MSVC Static
+    name: Windows x64 MSVC Static (${{ matrix.name }})
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Release /MT
+            cfg: release
+            meson_buildtype: release
+            b_vscrt: mt
+            pc_subdir: lib/pkgconfig
+            vcpkg_lib_subdir: lib
+            expected_iterator_debug_level: "0"
+          - name: Debug /MTd
+            cfg: debug
+            meson_buildtype: debug
+            b_vscrt: mtd
+            pc_subdir: debug/lib/pkgconfig
+            vcpkg_lib_subdir: debug/lib
+            expected_iterator_debug_level: "2"
 
     steps:
       - name: Checkout code
@@ -74,7 +92,11 @@ jobs:
             throw "pkgconf executable not found under $pkgconfDir"
           }
 
-          $pc = "$env:VCPKG_DIR\installed\x64-windows-static\lib\pkgconfig"
+          $pc = "$env:VCPKG_DIR\installed\x64-windows-static\${{ matrix.pc_subdir }}"
+          if (-not (Test-Path $pc)) {
+            throw "pkg-config directory not found: $pc"
+          }
+
           "PKG_CONFIG=$pkgconf" >> $env:GITHUB_ENV
           "PKG_CONFIG_PATH=$pc" >> $env:GITHUB_ENV
           "PKG_CONFIG_LIBDIR=$pc" >> $env:GITHUB_ENV
@@ -84,10 +106,11 @@ jobs:
       - name: Configure libvips
         shell: pwsh
         run: |
-          meson setup build-msvc-static `
-            --buildtype=release `
+          $buildDir = "build-msvc-static-${{ matrix.cfg }}"
+          meson setup $buildDir `
+            --buildtype=${{ matrix.meson_buildtype }} `
             --default-library=static `
-            -Db_vscrt=mt `
+            -Db_vscrt=${{ matrix.b_vscrt }} `
             --auto-features=disabled `
             -Dmodules=disabled `
             -Ddeprecated=false `
@@ -108,14 +131,16 @@ jobs:
             -Dwebp=enabled
 
       - name: Build libvips
-        run: meson compile -C build-msvc-static
+        run: meson compile -C build-msvc-static-${{ matrix.cfg }}
 
       - name: Stage artifacts
         shell: pwsh
         run: |
-          $out = Join-Path $PWD "out"
+          $buildDir = "build-msvc-static-${{ matrix.cfg }}"
+          $out = Join-Path $PWD "out-${{ matrix.cfg }}"
           New-Item -ItemType Directory -Path $out -Force | Out-Null
-          meson install -C build-msvc-static --destdir $out --no-rebuild
+          New-Item -ItemType Directory -Path "$out\lib\deps" -Force | Out-Null
+          meson install -C $buildDir --destdir $out --no-rebuild
 
           Copy-Item "$out\lib\libvips.a" "$out\lib\libvips.lib" -Force
           if (Test-Path "$out\lib\libvips-cpp.a") {
@@ -125,11 +150,70 @@ jobs:
           $line = (& $env:PKG_CONFIG --libs --static `
             glib-2.0 gio-2.0 gobject-2.0 expat zlib libjpeg libpng libwebp libwebpmux libwebpdemux libtiff-4).Trim()
 
+          # Copy third-party static libraries from vcpkg to make the artifact self-contained.
+          $vcpLib = "$env:VCPKG_DIR\installed\x64-windows-static\${{ matrix.vcpkg_lib_subdir }}"
+          $tokens = $line.Split(' ') | Where-Object { $_ -and $_.StartsWith('-l') }
+          $libNames = $tokens | ForEach-Object { $_.Substring(2) } | Select-Object -Unique
+          $copied = @()
+          $missing = @()
+          foreach ($name in $libNames) {
+            $candidates = @("$vcpLib\$name.lib", "$vcpLib\lib$name.lib")
+            $hit = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($hit) {
+              Copy-Item $hit "$out\lib\deps\" -Force
+              $copied += (Split-Path $hit -Leaf)
+            } else {
+              $missing += $name
+            }
+          }
+
+          # Copy third-party headers needed by libvips consumers.
+          $depsInc = "$out\deps\include"
+          New-Item -ItemType Directory -Path $depsInc -Force | Out-Null
+          Copy-Item -Recurse "$env:VCPKG_DIR\installed\x64-windows-static\include\*" $depsInc -Force
+
+          $glibCfg = "$env:VCPKG_DIR\installed\x64-windows-static\${{ matrix.vcpkg_lib_subdir }}\glib-2.0\include"
+          if (Test-Path $glibCfg) {
+            New-Item -ItemType Directory -Path "$out\deps\lib\glib-2.0" -Force | Out-Null
+            Copy-Item -Recurse $glibCfg "$out\deps\lib\glib-2.0\" -Force
+          }
+
           @(
+            "Include paths:"
+            "- out-${{ matrix.cfg }}/include"
+            "- out-${{ matrix.cfg }}/deps/include"
+            "- out-${{ matrix.cfg }}/deps/lib/glib-2.0/include"
+            ""
+            "Library paths:"
+            "- out-${{ matrix.cfg }}/lib"
+            "- out-${{ matrix.cfg }}/lib/deps"
+            ""
+            "Always link these in your project:"
+            "- libvips.lib"
+            "- libvips-cpp.lib (if you use C++ API)"
+            ""
+            "Use only this configuration's artifact with matching app build type."
+          ) | Set-Content -Path "$out\USAGE.txt" -Encoding UTF8
+
+          $depsLines = @(
             "libvips static (MSVC) dependency notes"
             ""
             "pkg-config --libs --static result:"
             $line
+            ""
+            "Copied dependency libs:"
+          )
+          $depsLines += ($copied | Sort-Object | ForEach-Object { "- $_" })
+          $depsLines += @(
+            ""
+            "Unresolved -l entries (usually Windows SDK libs):"
+          )
+          if ($missing.Count -gt 0) {
+            $depsLines += ($missing | ForEach-Object { "- $_" })
+          } else {
+            $depsLines += "- (none)"
+          }
+          $depsLines += @(
             ""
             "Common Windows SDK libs to link when needed:"
             "- ws2_32.lib"
@@ -137,21 +221,52 @@ jobs:
             "- shlwapi.lib"
             "- dnsapi.lib"
             "- iphlpapi.lib"
-          ) | Set-Content -Path "$out\DEPENDENCIES.txt" -Encoding UTF8
+          )
+          $depsLines | Set-Content -Path "$out\DEPENDENCIES.txt" -Encoding UTF8
+
+          @(
+            "Binary compatibility contract"
+            ""
+            "Configuration: ${{ matrix.cfg }}"
+            "Meson buildtype: ${{ matrix.meson_buildtype }}"
+            "MSVC runtime expected in consumer target: ${{ matrix.b_vscrt }}"
+            "Expected _ITERATOR_DEBUG_LEVEL in consumer target: ${{ matrix.expected_iterator_debug_level }}"
+            ""
+            "Do not mix release and debug artifacts."
+            "Do not mix /MD and /MT variants."
+          ) | Set-Content -Path "$out\BINARY_COMPAT.txt" -Encoding UTF8
+
+      - name: Validate CRT consistency
+        shell: pwsh
+        run: |
+          $out = Join-Path $PWD "out-${{ matrix.cfg }}"
+          $vipsLib = "$out\lib\libvips.lib"
+          if (-not (Test-Path $vipsLib)) {
+            throw "Missing expected library: $vipsLib"
+          }
+
+          $dirs = (dumpbin /nologo /directives $vipsLib) -join "`n"
+          if ($dirs -match "DEFAULTLIB:MSVCRT|DEFAULTLIB:MSVCRTD") {
+            throw "Detected dynamic CRT defaultlib (MSVCRT/MSVCRTD) in $vipsLib"
+          }
 
       - name: Upload static artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: libvips-msvc-static-x64
+          name: libvips-msvc-static-x64-${{ matrix.cfg }}
           path: |
-            out/include/**
-            out/lib/**
-            out/DEPENDENCIES.txt
+            out-${{ matrix.cfg }}/include/**
+            out-${{ matrix.cfg }}/lib/**
+            out-${{ matrix.cfg }}/deps/**
+            out-${{ matrix.cfg }}/USAGE.txt
+            out-${{ matrix.cfg }}/DEPENDENCIES.txt
+            out-${{ matrix.cfg }}/BINARY_COMPAT.txt
 
       - name: Print Meson log on failure
         if: failure()
         shell: pwsh
         run: |
-          if (Test-Path "build-msvc-static\meson-logs\meson-log.txt") {
-            Get-Content "build-msvc-static\meson-logs\meson-log.txt"
+          $buildDir = "build-msvc-static-${{ matrix.cfg }}"
+          if (Test-Path "$buildDir\meson-logs\meson-log.txt") {
+            Get-Content "$buildDir\meson-logs\meson-log.txt"
           }
